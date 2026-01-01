@@ -1,0 +1,144 @@
+name: Java CI with Maven
+
+on:
+  push:
+    branches: [ "develop", "master" ]
+  pull_request:
+    branches: [ "develop" ]
+
+permissions:
+  contents: write
+
+jobs:
+
+  # =====================================================
+  # BUILD (develop + PR)
+  # =====================================================
+  build:
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build & test
+        env:
+          MAVEN_REPO_USER: ${{ secrets.MAVEN_USER }}
+          MAVEN_REPO_PASSWORD: ${{ secrets.MAVEN_PASS }}
+        run: mvn -B clean test -s .m2/settings.xml --file pom.xml
+
+  # =====================================================
+  # DEVELOP: SNAPSHOT bump + deploy + commit
+  # =====================================================
+  develop:
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Bump SNAPSHOT version (patch)
+        run: |
+          mvn -B -q build-helper:parse-version versions:set \
+            -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.minorVersion}.\${parsedVersion.nextIncrementalVersion}-SNAPSHOT \
+            -DgenerateBackupPoms=false
+
+      - name: Commit SNAPSHOT bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore: bump snapshot version [skip ci]"
+          git push origin HEAD:develop
+
+      - name: Deploy SNAPSHOT
+        env:
+          MAVEN_REPO_USER: ${{ secrets.MAVEN_USER }}
+          MAVEN_REPO_PASSWORD: ${{ secrets.MAVEN_PASS }}
+        run: mvn -B deploy -s .m2/settings.xml --file pom.xml
+
+  # =====================================================
+  # MASTER: RELEASE (MINOR UP) + TAG + DEPLOY + DEVELOP BUMP
+  # =====================================================
+  release:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # ---------- RELEASE VERSION (minor up) ----------
+      - name: Set RELEASE version (minor)
+        run: |
+          mvn -B -q build-helper:parse-version versions:set \
+            -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.nextMinorVersion}.0 \
+            -DgenerateBackupPoms=false
+
+      - name: Commit RELEASE + tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          VERSION=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive exec:exec)
+
+          git commit -m "release: ${VERSION}"
+          git tag "v${VERSION}"
+          git push origin HEAD:master --tags
+
+      - name: Deploy RELEASE
+        env:
+          MAVEN_REPO_USER: ${{ secrets.MAVEN_USER }}
+          MAVEN_REPO_PASSWORD: ${{ secrets.MAVEN_PASS }}
+        run: mvn -B deploy -s .m2/settings.xml --file pom.xml
+
+      # ---------- DEVELOP NEXT SNAPSHOT ----------
+      - name: Checkout develop
+        run: |
+          git fetch origin
+          git checkout develop
+          git pull origin develop
+
+      - name: Bump develop to next SNAPSHOT
+        run: |
+          mvn -B -q build-helper:parse-version versions:set \
+            -DnewVersion=\${parsedVersion.majorVersion}.\${parsedVersion.minorVersion}.\${parsedVersion.nextIncrementalVersion}-SNAPSHOT \
+            -DgenerateBackupPoms=false
+
+      - name: Commit develop SNAPSHOT
+        run: |
+          git add -A
+          git commit -m "chore: prepare next development iteration [skip ci]"
+          git push origin HEAD:develop
